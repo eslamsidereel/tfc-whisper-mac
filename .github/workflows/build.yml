@@ -55,7 +55,7 @@ jobs:
           lipo -archs out/whisper-cli | grep -q "x86_64 arm64"
           echo "--- linked libraries (system only allowed):"
           otool -L out/whisper-cli
-          if otool -L out/whisper-cli | tail -n +2 | grep -v -E "^\s+(/usr/lib/|/System/Library/)"; then
+          if otool -L out/whisper-cli | grep -E "^[[:space:]]" | grep -v -E "^[[:space:]]+(/usr/lib/|/System/Library/)"; then
             echo "whisper-cli links something outside the system - it would not run on an editor's Mac"; exit 1
           fi
 
