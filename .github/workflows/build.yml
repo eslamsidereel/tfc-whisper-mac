@@ -1,0 +1,83 @@
+name: build
+
+# Builds whisper.cpp's whisper-cli for macOS from its official source: one
+# universal binary (Apple Silicon + Intel), statically linked, so the TFC
+# Captions panel can download it on any Mac with no Homebrew and no Terminal.
+# Homebrew no longer installs on Intel Macs, which is why this exists.
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: "whisper.cpp tag to build (match the Windows builds the panel uses)"
+        default: "b4938"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      REF: ${{ inputs.whisper_ref }}
+    steps:
+      - name: Get whisper.cpp source
+        run: git clone --depth 1 --branch "$REF" https://github.com/ggml-org/whisper.cpp src
+
+      - name: Build Apple Silicon (Metal GPU + Accelerate)
+        working-directory: src
+        run: |
+          cmake -B build-arm64 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 \
+            -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=ON \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF
+          cmake --build build-arm64 --config Release -j 4 --target whisper-cli
+
+      - name: Build Intel (AVX2 + Accelerate, CPU)
+        working-directory: src
+        run: |
+          cmake -B build-x86 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+            -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DGGML_METAL=OFF -DGGML_BLAS=ON \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF
+          cmake --build build-x86 --config Release -j 4 --target whisper-cli
+
+      - name: Combine into one universal binary
+        run: |
+          mkdir -p out
+          lipo -create src/build-arm64/bin/whisper-cli src/build-x86/bin/whisper-cli -output out/whisper-cli
+          codesign --force --sign - out/whisper-cli
+          file out/whisper-cli
+          lipo -archs out/whisper-cli | grep -q "x86_64 arm64"
+          echo "--- linked libraries (system only allowed):"
+          otool -L out/whisper-cli
+          if otool -L out/whisper-cli | tail -n +2 | grep -v -E "^\s+(/usr/lib/|/System/Library/)"; then
+            echo "whisper-cli links something outside the system - it would not run on an editor's Mac"; exit 1
+          fi
+
+      - name: Prove both halves transcribe
+        working-directory: src
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          sh ./models/download-ggml-model.sh tiny.en
+          ../out/whisper-cli -m models/ggml-tiny.en.bin -f samples/jfk.wav -nt -np > arm.txt
+          arch -x86_64 ../out/whisper-cli -m models/ggml-tiny.en.bin -f samples/jfk.wav -nt -np > x86.txt
+          cat arm.txt x86.txt
+          grep -qi "ask not what your country" arm.txt
+          grep -qi "ask not what your country" x86.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp src/LICENSE out/LICENSE-whisper.cpp.txt
+          cd out && zip -9 whisper-cli-macos-universal.zip whisper-cli LICENSE-whisper.cpp.txt && cd ..
+          shasum -a 256 out/whisper-cli-macos-universal.zip
+          gh release create "whisper-$REF-mac" out/whisper-cli-macos-universal.zip \
+            --repo "$GITHUB_REPOSITORY" --title "whisper-cli $REF for macOS (universal)" \
+            --notes "whisper.cpp $REF built from source: one binary for Apple Silicon (Metal GPU) and Intel (AVX2). Statically linked. Verified by transcribing whisper.cpp's jfk.wav natively and under Rosetta." \
+            || gh release upload "whisper-$REF-mac" out/whisper-cli-macos-universal.zip --repo "$GITHUB_REPOSITORY" --clobber
